@@ -17,6 +17,7 @@ import android.os.AsyncTask;
 import android.os.Build;
 import android.support.v4.util.LruCache;
 import android.util.DisplayMetrics;
+import android.util.Log;
 import android.view.Display;
 import android.view.WindowManager;
 import android.widget.ImageView;
@@ -34,6 +35,7 @@ public class TileBitmapDrawable extends Drawable {
     private static final int TILE_SIZE_DENSITY_HIGH = 256;
 
     private static final int TILE_SIZE_DEFAULT = 128;
+    public static final String TAG = TileBitmapDrawable.class.getCanonicalName();
 
     // A shared cache is used between instances to minimize OutOfMemoryError
     private static BitmapLruCache sBitmapCache;
@@ -290,7 +292,7 @@ public class TileBitmapDrawable extends Drawable {
     public interface OnInitializeListener {
         public void onStartInitialization();
 
-        public void onEndInitialization();
+        public void onEndInitialization(int width, int height);
 
         public void onError(Exception ex);
     }
@@ -364,6 +366,8 @@ public class TileBitmapDrawable extends Drawable {
         private final ImageView mImageView;
 
         private final OnInitializeListener mListener;
+        private int bitmapWidth;
+        private int bitmapHeight;
 
         private InitializationTask(ImageView imageView, Drawable placeHolder, OnInitializeListener listener) {
             mImageView = imageView;
@@ -410,6 +414,8 @@ public class TileBitmapDrawable extends Drawable {
             Bitmap screenNail;
             try {
                 final Bitmap bitmap = decoder.decodeRegion(screenNailRect, options);
+                bitmapWidth = bitmap.getWidth();
+                bitmapHeight = bitmap.getHeight();
                 screenNail = Bitmap.createScaledBitmap(bitmap, Math.round(decoder.getWidth() * minScale), Math.round(decoder.getHeight() * minScale), true);
                 if (!bitmap.equals(screenNail)) {
                     bitmap.recycle();
@@ -432,8 +438,8 @@ public class TileBitmapDrawable extends Drawable {
         protected void onPostExecute(Object result) {
             if (result instanceof TileBitmapDrawable) {
                 // Success
+                if (mListener != null) mListener.onEndInitialization(bitmapWidth, bitmapHeight);
                 mImageView.setImageDrawable((TileBitmapDrawable) result);
-                if (mListener != null) mListener.onEndInitialization();
             } else if (result instanceof Exception && mListener != null) {
                 // Exception was thrown
                 mListener.onError((Exception) result);
