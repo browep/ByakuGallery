@@ -13,6 +13,7 @@ import android.graphics.Paint;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
+import android.media.ExifInterface;
 import android.os.AsyncTask;
 import android.os.Build;
 import android.support.v4.util.LruCache;
@@ -22,10 +23,14 @@ import android.view.Display;
 import android.view.WindowManager;
 import android.widget.ImageView;
 
+import com.android.mms.exif.ExifTag;
+
+import java.io.BufferedInputStream;
 import java.io.FileDescriptor;
 import java.io.InputStream;
 import java.lang.ref.WeakReference;
 import java.util.Arrays;
+import java.util.ListIterator;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -65,6 +70,7 @@ public class TileBitmapDrawable extends Drawable {
     private final Bitmap mScreenNail;
 
     private final Paint mPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private final int mDegree;
 
     private Matrix mMatrix;
 
@@ -77,6 +83,7 @@ public class TileBitmapDrawable extends Drawable {
     private final Rect mVisibleAreaRect = new Rect();
 
     private final Rect mScreenNailRect = new Rect();
+    private Rect mDecodeRect = new Rect();
 
     public static void attachTileBitmapDrawable(ImageView imageView, String path, Drawable placeHolder, OnInitializeListener listener) {
         new InitializationTask(imageView, placeHolder, listener).execute(path);
@@ -90,14 +97,21 @@ public class TileBitmapDrawable extends Drawable {
         new InitializationTask(imageView, placeHolder, listener).execute(is);
     }
 
-    private TileBitmapDrawable(ImageView parentView, BitmapRegionDecoder decoder, Bitmap screenNail) {
+    private TileBitmapDrawable(ImageView parentView, BitmapRegionDecoder decoder, Bitmap screenNail, int degree) {
         mParentView = new WeakReference<ImageView>(parentView);
 
-        synchronized (decoder) {
+        synchronized(decoder) {
             mRegionDecoder = decoder;
-            mIntrinsicWidth = mRegionDecoder.getWidth();
-            mIntrinsicHeight = mRegionDecoder.getHeight();
+            if (degree == 0 || degree == 180) {
+                mIntrinsicWidth = mRegionDecoder.getWidth();
+                mIntrinsicHeight = mRegionDecoder.getHeight();
+            }
+            else {
+                mIntrinsicWidth = mRegionDecoder.getHeight();
+                mIntrinsicHeight = mRegionDecoder.getWidth();
+            }
         }
+        mDegree = degree; // add a member variables "mDegree" to TileBitmapDrawable
 
         final DisplayMetrics metrics = new DisplayMetrics();
         getDisplayMetrics(parentView.getContext(), metrics);
@@ -120,7 +134,7 @@ public class TileBitmapDrawable extends Drawable {
             }
         }
 
-        mDecoderWorker = new DecoderWorker(this, mRegionDecoder, mDecodeQueue);
+        mDecoderWorker = new DecoderWorker(this, mRegionDecoder, mDecodeQueue, mDegree);
         mDecoderWorker.start();
     }
 
@@ -224,10 +238,35 @@ public class TileBitmapDrawable extends Drawable {
                 final int tileRight = (i + 1) * currentTileSize <= mIntrinsicWidth ? (i + 1) * currentTileSize : mIntrinsicWidth;
                 final int tileBottom = (j + 1) * currentTileSize <= mIntrinsicHeight ? (j + 1) * currentTileSize : mIntrinsicHeight;
                 mTileRect.set(tileLeft, tileTop, tileRight, tileBottom);
+                // add a member variables "mDecodeRect" to TileBitmapDrawable
+                if (mDegree == 90) {
+                    final int decodeLeft = tileTop;
+                    final int decodeRight = tileBottom;
+                    final int decodeTop = mIntrinsicWidth - tileRight;
+                    final int decodeBottom = mIntrinsicWidth - tileLeft;
+                    mDecodeRect.set(decodeLeft, decodeTop, decodeRight, decodeBottom);
+                }
+                else if (mDegree == 180) {
+                    final int decodeLeft = mIntrinsicWidth - tileRight;
+                    final int decodeRight = mIntrinsicWidth - tileLeft;
+                    final int decodeTop = mIntrinsicHeight - tileBottom;
+                    final int decodeBottom = mIntrinsicHeight - tileTop;
+                    mDecodeRect.set(decodeLeft, decodeTop, decodeRight, decodeBottom);
+                }
+                else if (mDegree == 270) {
+                    final int decodeLeft = mIntrinsicHeight - tileBottom;
+                    final int decodeRight = mIntrinsicHeight - tileTop;
+                    final int decodeTop =tileLeft;
+                    final int decodeBottom = tileRight;
+                    mDecodeRect.set(decodeLeft, decodeTop, decodeRight, decodeBottom);
+                }
+                else {
+                    mDecodeRect.set(tileLeft, tileTop, tileRight, tileBottom);
+                }
 
                 if (Rect.intersects(mVisibleAreaRect, mTileRect)) {
 
-                    final Tile tile = new Tile(mInstanceId, mTileRect, i, j, currentLevel);
+                    final Tile tile = new Tile(mInstanceId, mTileRect, mDecodeRect, i, j, currentLevel);
 
                     Bitmap cached = null;
                     synchronized (sBitmapCacheLock) {
@@ -300,6 +339,7 @@ public class TileBitmapDrawable extends Drawable {
     private static final class Tile {
 
         private final int mInstanceId;
+        private Rect decodeRect;
 
         private final Rect mTileRect;
 
@@ -309,8 +349,9 @@ public class TileBitmapDrawable extends Drawable {
 
         private final int mLevel;
 
-        private Tile(int instanceId, Rect tileRect, int horizontalPos, int verticalPos, int level) {
+        private Tile(int instanceId, Rect tileRect, Rect decodeRect, int horizontalPos, int verticalPos, int level) {
             mInstanceId = instanceId;
+            this.decodeRect = decodeRect;
             mTileRect = new Rect();
             mTileRect.set(tileRect);
             mHorizontalPos = horizontalPos;
@@ -384,6 +425,7 @@ public class TileBitmapDrawable extends Drawable {
         @Override
         protected Object doInBackground(Object... params) {
             BitmapRegionDecoder decoder = null;
+            int degree = 0;
 
             try {
                 if (params[0] instanceof String) {
@@ -391,7 +433,20 @@ public class TileBitmapDrawable extends Drawable {
                 } else if (params[0] instanceof FileDescriptor) {
                     decoder = BitmapRegionDecoder.newInstance((FileDescriptor) params[0], false);
                 } else {
-                    decoder = BitmapRegionDecoder.newInstance((InputStream) params[0], false);
+                    InputStream inputStream = (InputStream) params[0];
+                    BufferedInputStream bufferedInputStream = new BufferedInputStream(inputStream);
+                    bufferedInputStream.mark(1024 * 1024);
+
+                    com.android.mms.exif.ExifInterface exifInterface = new com.android.mms.exif.ExifInterface();
+                    exifInterface.readExif(bufferedInputStream);
+                    ExifTag tag = exifInterface.getTag(com.android.mms.exif.ExifInterface.TAG_ORIENTATION);
+                    short orientationInt = (short) tag.getValueAsInt(-1);
+                    Log.d(TAG, "orientation: " + orientationInt);
+                    degree = com.android.mms.exif.ExifInterface.getRotationForOrientationValue(orientationInt);
+
+                    bufferedInputStream.reset();
+
+                    decoder = BitmapRegionDecoder.newInstance(bufferedInputStream, false);
                 }
             } catch (Exception e) {
                 return e;
@@ -421,6 +476,16 @@ public class TileBitmapDrawable extends Drawable {
                     bitmap.recycle();
                 }
 
+                if (degree != 0) {
+                    Matrix matrix = new Matrix();
+                    matrix.setRotate(degree);
+                    Bitmap screenNailRotated = Bitmap.createBitmap(screenNail, 0, 0,
+                            screenNail.getWidth(), screenNail.getHeight(), matrix, true);
+                    screenNail.recycle();
+                    screenNail = screenNailRotated;
+                }
+
+
             } catch (OutOfMemoryError e) {
                 // We're under memory pressure. Let's try again with a smaller size
                 options.inSampleSize <<= 1;
@@ -428,7 +493,7 @@ public class TileBitmapDrawable extends Drawable {
             }
 
             try {
-                return new TileBitmapDrawable(mImageView, decoder, screenNail);
+                return new TileBitmapDrawable(mImageView, decoder, screenNail, degree);
             } catch (Exception ex) {
                 return ex;
             }
@@ -459,8 +524,10 @@ public class TileBitmapDrawable extends Drawable {
         private final BlockingQueue<Tile> mDecodeQueue;
 
         private boolean mQuit;
+        private int degree;
 
-        private DecoderWorker(TileBitmapDrawable drawable, BitmapRegionDecoder decoder, BlockingQueue<Tile> decodeQueue) {
+        private DecoderWorker(TileBitmapDrawable drawable, BitmapRegionDecoder decoder, BlockingQueue<Tile> decodeQueue, int degree) {
+            this.degree = degree;
             mDrawableReference = new WeakReference<TileBitmapDrawable>(drawable);
             mDecoder = decoder;
             mDecodeQueue = decodeQueue;
@@ -497,7 +564,7 @@ public class TileBitmapDrawable extends Drawable {
                 Bitmap bitmap = null;
                 synchronized (mDecoder) {
                     try {
-                        bitmap = mDecoder.decodeRegion(tile.mTileRect, options);
+                        bitmap = mDecoder.decodeRegion(tile.decodeRect, options);
                     } catch (OutOfMemoryError e) {
                         // Skip for now. The screenNail will be used instead
                     }
@@ -505,6 +572,13 @@ public class TileBitmapDrawable extends Drawable {
 
                 if (bitmap == null) {
                     continue;
+                }
+
+                if (degree != 0) {
+                    Matrix matrix = new Matrix();
+                    matrix.setRotate(degree);
+                    bitmap = Bitmap.createBitmap(bitmap, 0, 0,
+                            bitmap.getWidth(), bitmap.getHeight(), matrix, true);
                 }
 
                 synchronized (sBitmapCacheLock) {
